@@ -1,540 +1,521 @@
 /*
- * attacker.c  (Windows / Winsock2 port)
- * Man-in-the-Middle Simulator - Attacker (MITM)
+ * attacker.c
+ * CLI Man-in-the-Middle for:
  *
- * Relays frames between sender.c and receiver.c.
- * Supports 8 attack modes.  Receives control commands from Python GUI.
- * Emits EVENT| lines to stdout.
+ *   sender <-> attacker <-> receiver
  *
- * Port layout:
- *   sender.c   → connects to → ATTACKER_DATA_PORT (5001)
- *   receiver.c → connects to → ATTACKER_ACK_PORT  (5003)
- *   attacker   → connects to → RECEIVER_DATA_PORT (5002)
- *   attacker   → connects to → SENDER_ACK_PORT    (5000)
- *   Python GUI → connects to → CONTROL_PORT       (5100)
+ * Sender connects to attacker:5000.
+ * Attacker connects to receiver:5001.
+ *
+ * Attack selection is entered at the attacker CLI while the network
+ * forwarding threads continue running.
+ *
+ * Modes:
+ *   0  NO ATTACK
+ *   1  DROP DATA
+ *   2  DELAY DATA
+ *   3  DUPLICATE DATA
+ *   4  MODIFY DATA
+ *   5  DROP ACK
+ *   6  RANDOM ATTACK
+ *   7  MULTIPLE ATTACKS
+ *
+ * Multiple attack command example:
+ *   multi 4 5
  */
 
-#ifndef _WIN32_WINNT
-#  define _WIN32_WINNT 0x0601
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <windows.h>
-#include <process.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
-/* ─── Ports ───────────────────────────────────────────────────────────────── */
-#define ATTACKER_DATA_PORT  5001
-#define ATTACKER_ACK_PORT   5003
-#define RECEIVER_DATA_HOST "127.0.0.1"
-#define RECEIVER_DATA_PORT  5002
-#define SENDER_ACK_HOST    "127.0.0.1"
-#define SENDER_ACK_PORT     5000
-#define CONTROL_PORT        5100
+#define LISTEN_IP "127.0.0.1"
+#define LISTEN_PORT 5000
 
-/* ─── Protocol ────────────────────────────────────────────────────────────── */
-#define MAX_DATA_LEN 1024
-#define FRAME_DATA   0
-#define FRAME_ACK    1
+#define RECEIVER_IP "127.0.0.1"
+#define RECEIVER_PORT 5001
 
-/* ─── Attack modes ────────────────────────────────────────────────────────── */
-#define ATTACK_NONE      0
-#define ATTACK_DROP_DATA 1
-#define ATTACK_DELAY     2
-#define ATTACK_DUPLICATE 3
-#define ATTACK_MODIFY    4
-#define ATTACK_DROP_ACK  5
-#define ATTACK_RANDOM    6
-#define ATTACK_MULTI     7
+#define MAX_DATA 1023
+#define TYPE_DATA 1u
+#define TYPE_ACK  2u
 
-#define MULTI_DROP_DATA  (1 << 0)
-#define MULTI_DELAY      (1 << 1)
-#define MULTI_DUPLICATE  (1 << 2)
-#define MULTI_MODIFY     (1 << 3)
-#define MULTI_DROP_ACK   (1 << 4)
-
-/* ─── Frame ───────────────────────────────────────────────────────────────── */
 typedef struct {
-    int          type;
-    int          sequence;
-    char         data[MAX_DATA_LEN];
-    unsigned int checksum;
-} Frame;
+    uint32_t type;
+    uint32_t sequence;
+    uint32_t length;
+    uint32_t checksum;
+} FrameHeader;
 
-/* ─── Globals ─────────────────────────────────────────────────────────────── */
-static SOCKET data_listen        = INVALID_SOCKET;
-static SOCKET ack_listen         = INVALID_SOCKET;
-static SOCKET ctrl_listen        = INVALID_SOCKET;
-static SOCKET sender_data_sock   = INVALID_SOCKET;
-static SOCKET receiver_ack_sock  = INVALID_SOCKET;
-static SOCKET to_receiver_sock   = INVALID_SOCKET;
-static SOCKET to_sender_ack_sock = INVALID_SOCKET;
+typedef struct {
+    uint32_t type;
+    uint32_t sequence;
+    uint32_t length;
+    uint32_t checksum;
+    unsigned char data[MAX_DATA];
+} Packet;
 
-static CRITICAL_SECTION attack_mutex;
-static int current_attack = ATTACK_NONE;
-static int multi_mask     = 0;
-static int delay_ms       = 2000;
+typedef struct {
+    int sender_fd;
+    int receiver_fd;
+} RelayArgs;
 
-static CRITICAL_SECTION stats_mutex;
-static int stat_intercepted = 0;
-static int stat_forwarded   = 0;
-static int stat_dropped     = 0;
-static int stat_modified    = 0;
-static int stat_duplicated  = 0;
-static int stat_ack_dropped = 0;
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int attack_mode = 0;
+static int multi_modes[8] = {0};
+static unsigned int delay_ms = 1500;
+static volatile int running = 1;
 
-/* ─── Emit ────────────────────────────────────────────────────────────────── */
-static void emit(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    putchar('\n');
-    fflush(stdout);
+static uint32_t checksum_bytes(const unsigned char *data, size_t len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; ++i)
+        sum = (sum + data[i]) & 0xFFFFFFFFu;
+    return sum;
 }
 
-/* ─── Helpers ─────────────────────────────────────────────────────────────── */
-static int send_all(SOCKET fd, const void *buf, size_t len)
-{
-    size_t sent = 0;
-    while (sent < len) {
-        int n = send(fd, (const char*)buf + sent, (int)(len - sent), 0);
-        if (n <= 0) return -1;
-        sent += n;
+static int send_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += n;
+        len -= (size_t)n;
     }
     return 0;
 }
 
-static int recv_all(SOCKET fd, void *buf, size_t len)
-{
-    size_t got = 0;
-    while (got < len) {
-        int n = recv(fd, (char*)buf + got, (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += n;
-    }
-    return 0;
-}
-
-/* ─── Stats ───────────────────────────────────────────────────────────────── */
-static void emit_stats(void)
-{
-    EnterCriticalSection(&stats_mutex);
-    emit("EVENT|ATTACKER|STATS|intercepted=%d|forwarded=%d|dropped=%d|modified=%d|duplicated=%d|ack_dropped=%d",
-         stat_intercepted, stat_forwarded, stat_dropped,
-         stat_modified, stat_duplicated, stat_ack_dropped);
-    LeaveCriticalSection(&stats_mutex);
-}
-
-/* ─── Attack helpers ──────────────────────────────────────────────────────── */
-static const char *attack_name(int a)
-{
-    switch (a) {
-        case ATTACK_NONE:      return "NO_ATTACK";
-        case ATTACK_DROP_DATA: return "DROP_DATA";
-        case ATTACK_DELAY:     return "DELAY_DATA";
-        case ATTACK_DUPLICATE: return "DUPLICATE";
-        case ATTACK_MODIFY:    return "MODIFY_DATA";
-        case ATTACK_DROP_ACK:  return "DROP_ACK";
-        case ATTACK_RANDOM:    return "RANDOM";
-        case ATTACK_MULTI:     return "MULTIPLE";
-        default:               return "UNKNOWN";
-    }
-}
-
-static void apply_modify(Frame *f)
-{
-    if (strlen(f->data) > 0)
-        f->data[0] = (f->data[0] == 'X') ? 'Y' : 'X';
-}
-
-static void forward_data(Frame *f)
-{
-    if (send_all(to_receiver_sock, f, sizeof(Frame)) < 0)
-        emit("EVENT|ATTACKER|ERROR|msg=Forward to receiver failed");
-}
-
-static void forward_ack(Frame *f)
-{
-    if (send_all(to_sender_ack_sock, f, sizeof(Frame)) < 0)
-        emit("EVENT|ATTACKER|ERROR|msg=Forward ACK to sender failed");
-}
-
-/* ─── Process DATA frame ──────────────────────────────────────────────────── */
-static void process_data_frame(Frame *frame)
-{
-    EnterCriticalSection(&stats_mutex);
-    stat_intercepted++;
-    LeaveCriticalSection(&stats_mutex);
-
-    EnterCriticalSection(&attack_mutex);
-    int attack = current_attack;
-    int multi  = multi_mask;
-    int dly    = delay_ms;
-    LeaveCriticalSection(&attack_mutex);
-
-    emit("EVENT|ATTACKER|DATA_RECEIVED|seq=%d|attack=%s",
-         frame->sequence, attack_name(attack));
-
-    if (attack == ATTACK_RANDOM) {
-        attack = (rand() % 5) + 1;
-        emit("EVENT|ATTACKER|RANDOM_RESOLVED|resolved=%s", attack_name(attack));
-    }
-
-    if (attack == ATTACK_DROP_DATA) {
-        EnterCriticalSection(&stats_mutex); stat_dropped++; LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|DATA_DROPPED|seq=%d", frame->sequence);
-        emit_stats(); return;
-    }
-
-    if (attack == ATTACK_DELAY) {
-        emit("EVENT|ATTACKER|DATA_DELAYED|seq=%d|delay=%d", frame->sequence, dly);
-        Sleep(dly);
-        forward_data(frame);
-        EnterCriticalSection(&stats_mutex); stat_forwarded++; LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|DATA_FORWARDED|seq=%d", frame->sequence);
-        emit_stats(); return;
-    }
-
-    if (attack == ATTACK_DUPLICATE) {
-        forward_data(frame);
-        Sleep(50);
-        forward_data(frame);
-        EnterCriticalSection(&stats_mutex);
-        stat_forwarded++; stat_duplicated++;
-        LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|DATA_DUPLICATED|seq=%d", frame->sequence);
-        emit_stats(); return;
-    }
-
-    if (attack == ATTACK_MODIFY) {
-        apply_modify(frame);
-        forward_data(frame);
-        EnterCriticalSection(&stats_mutex);
-        stat_forwarded++; stat_modified++;
-        LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|DATA_MODIFIED|seq=%d", frame->sequence);
-        emit_stats(); return;
-    }
-
-    if (attack == ATTACK_MULTI) {
-        if (multi & MULTI_DROP_DATA) {
-            EnterCriticalSection(&stats_mutex); stat_dropped++; LeaveCriticalSection(&stats_mutex);
-            emit("EVENT|ATTACKER|DATA_DROPPED|seq=%d|mode=multi", frame->sequence);
-            emit_stats(); return;
+static int recv_all(int fd, void *buf, size_t len) {
+    unsigned char *p = buf;
+    while (len) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
         }
-        if (multi & MULTI_MODIFY) apply_modify(frame);
-        if (multi & MULTI_DELAY) {
-            emit("EVENT|ATTACKER|DATA_DELAYED|seq=%d|delay=%d|mode=multi", frame->sequence, dly);
-            Sleep(dly);
-        }
-        forward_data(frame);
-        if (multi & MULTI_DUPLICATE) {
-            Sleep(50);
-            forward_data(frame);
-            EnterCriticalSection(&stats_mutex); stat_duplicated++; LeaveCriticalSection(&stats_mutex);
-        }
-        EnterCriticalSection(&stats_mutex);
-        stat_forwarded++;
-        if (multi & MULTI_MODIFY) stat_modified++;
-        LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|DATA_FORWARDED|seq=%d|mode=multi", frame->sequence);
-        emit_stats(); return;
+        if (n == 0) return 0;
+        p += n;
+        len -= (size_t)n;
     }
-
-    /* ATTACK_NONE / default */
-    forward_data(frame);
-    EnterCriticalSection(&stats_mutex); stat_forwarded++; LeaveCriticalSection(&stats_mutex);
-    emit("EVENT|ATTACKER|DATA_FORWARDED|seq=%d", frame->sequence);
-    emit_stats();
+    return 1;
 }
 
-/* ─── Process ACK frame ───────────────────────────────────────────────────── */
-static void process_ack_frame(Frame *frame)
-{
-    EnterCriticalSection(&attack_mutex);
-    int attack = current_attack;
-    int multi  = multi_mask;
-    LeaveCriticalSection(&attack_mutex);
-
-    emit("EVENT|ATTACKER|ACK_RECEIVED|seq=%d|attack=%s",
-         frame->sequence, attack_name(attack));
-
-    int drop_ack = (attack == ATTACK_DROP_ACK);
-    if (attack == ATTACK_MULTI && (multi & MULTI_DROP_ACK)) drop_ack = 1;
-    if (attack == ATTACK_RANDOM && (rand() % 2 == 0))       drop_ack = 1;
-
-    if (drop_ack) {
-        EnterCriticalSection(&stats_mutex); stat_ack_dropped++; LeaveCriticalSection(&stats_mutex);
-        emit("EVENT|ATTACKER|ACK_DROPPED|seq=%d", frame->sequence);
-        emit_stats(); return;
+static int create_listener(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("attacker: socket");
+        return -1;
     }
 
-    forward_ack(frame);
-    emit("EVENT|ATTACKER|ACK_FORWARDED|seq=%d", frame->sequence);
-    emit_stats();
-}
-
-/* ─── Thread: DATA forwarding ─────────────────────────────────────────────── */
-static unsigned __stdcall data_thread(void *arg)
-{
-    (void)arg;
-    emit("EVENT|ATTACKER|DATA_THREAD_START");
-    while (1) {
-        Frame frame;
-        memset(&frame, 0, sizeof(frame));
-        if (recv_all(sender_data_sock, &frame, sizeof(Frame)) < 0) {
-            emit("EVENT|ATTACKER|ERROR|msg=Sender disconnected");
-            break;
-        }
-        process_data_frame(&frame);
-    }
-    return 0;
-}
-
-/* ─── Thread: ACK forwarding ──────────────────────────────────────────────── */
-static unsigned __stdcall ack_thread(void *arg)
-{
-    (void)arg;
-    emit("EVENT|ATTACKER|ACK_THREAD_START");
-    while (1) {
-        Frame frame;
-        memset(&frame, 0, sizeof(frame));
-        if (recv_all(receiver_ack_sock, &frame, sizeof(Frame)) < 0) {
-            emit("EVENT|ATTACKER|ERROR|msg=Receiver ACK disconnected");
-            break;
-        }
-        process_ack_frame(&frame);
-    }
-    return 0;
-}
-
-/* ─── Apply control command ───────────────────────────────────────────────── */
-static void apply_control_command(const char *cmd)
-{
-    emit("EVENT|ATTACKER|CONTROL_CMD|cmd=%s", cmd);
-
-    if (strncmp(cmd, "SET_ATTACK|", 11) == 0) {
-        int mode = atoi(cmd + 11);
-        EnterCriticalSection(&attack_mutex);
-        current_attack = mode;
-        if (mode != ATTACK_MULTI) multi_mask = 0;
-        LeaveCriticalSection(&attack_mutex);
-        emit("EVENT|ATTACKER|ATTACK_SET|mode=%d|name=%s", mode, attack_name(mode));
-
-    } else if (strncmp(cmd, "SET_DELAY|", 10) == 0) {
-        int ms = atoi(cmd + 10);
-        if (ms < 0) ms = 0;
-        EnterCriticalSection(&attack_mutex);
-        delay_ms = ms;
-        LeaveCriticalSection(&attack_mutex);
-        emit("EVENT|ATTACKER|DELAY_SET|ms=%d", ms);
-
-    } else if (strncmp(cmd, "SET_ATTACKS|", 12) == 0) {
-        const char *list = cmd + 12;
-        int mask = 0;
-        if (strstr(list, "DROP_DATA"))  mask |= MULTI_DROP_DATA;
-        if (strstr(list, "DELAY"))      mask |= MULTI_DELAY;
-        if (strstr(list, "DUPLICATE"))  mask |= MULTI_DUPLICATE;
-        if (strstr(list, "MODIFY"))     mask |= MULTI_MODIFY;
-        if (strstr(list, "DROP_ACK"))   mask |= MULTI_DROP_ACK;
-        EnterCriticalSection(&attack_mutex);
-        current_attack = ATTACK_MULTI;
-        multi_mask = mask;
-        LeaveCriticalSection(&attack_mutex);
-        emit("EVENT|ATTACKER|MULTI_ATTACK_SET|mask=%d|list=%s", mask, list);
-
-    } else {
-        emit("EVENT|ATTACKER|UNKNOWN_CMD|cmd=%s", cmd);
-    }
-}
-
-/* ─── Thread: control listener ────────────────────────────────────────────── */
-static unsigned __stdcall control_thread(void *arg)
-{
-    (void)arg;
-    emit("EVENT|ATTACKER|CONTROL_LISTEN|port=%d", CONTROL_PORT);
-
-    while (1) {
-        struct sockaddr_in cli;
-        int clen = sizeof(cli);
-        SOCKET csock = accept(ctrl_listen, (struct sockaddr*)&cli, &clen);
-        if (csock == INVALID_SOCKET) {
-            emit("EVENT|ATTACKER|CONTROL_ACCEPT_ERR");
-            continue;
-        }
-        emit("EVENT|ATTACKER|CONTROL_CONNECTED");
-
-        char buf[512];
-        int  pos = 0;
-        char c;
-        while (recv(csock, &c, 1, 0) > 0) {
-            if (c == '\n') {
-                buf[pos] = '\0';
-                if (pos > 0) {
-                    if (buf[pos-1] == '\r') buf[--pos] = '\0';
-                    apply_control_command(buf);
-                }
-                pos = 0;
-            } else if (pos < (int)sizeof(buf) - 1) {
-                buf[pos++] = c;
-            }
-        }
-        emit("EVENT|ATTACKER|CONTROL_DISCONNECTED");
-        closesocket(csock);
-    }
-    return 0;
-}
-
-/* ─── Create listener ────────────────────────────────────────────────────── */
-static SOCKET make_listener(int port)
-{
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
-
-    int opt = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
-
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(s); return INVALID_SOCKET;
-    }
-    if (listen(s, 2) == SOCKET_ERROR) {
-        closesocket(s); return INVALID_SOCKET;
-    }
-    return s;
-}
-
-/* ─── Connect to host:port (with retry) ──────────────────────────────────── */
-static SOCKET connect_to(const char *host, int port)
-{
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
+    addr.sin_port = htons(LISTEN_PORT);
+    inet_pton(AF_INET, LISTEN_IP, &addr.sin_addr);
 
-    for (int i = 0; i < 20; i++) {
-        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0)
-            return s;
-        Sleep(500);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("attacker: bind");
+        close(fd);
+        return -1;
     }
-    closesocket(s);
-    return INVALID_SOCKET;
+
+    if (listen(fd, 5) < 0) {
+        perror("attacker: listen");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
-/* ─── Main ───────────────────────────────────────────────────────────────── */
-int main(void)
-{
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
+static int connect_receiver(void) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(RECEIVER_PORT);
+    inet_pton(AF_INET, RECEIVER_IP, &addr.sin_addr);
+
+    for (int attempt = 1; attempt <= 30; ++attempt) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            perror("attacker: socket");
+            return -1;
+        }
+
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            printf("[ATTACKER] Connected to receiver at %s:%d\n",
+                   RECEIVER_IP, RECEIVER_PORT);
+            return fd;
+        }
+
+        close(fd);
+        if (attempt == 30) break;
+
+        printf("[ATTACKER] Receiver not ready; retrying (%d/30)...\n", attempt);
+        sleep(1);
     }
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    srand((unsigned)time(NULL));
+    fprintf(stderr, "[ATTACKER] Could not connect to receiver.\n");
+    return -1;
+}
 
-    InitializeCriticalSection(&attack_mutex);
-    InitializeCriticalSection(&stats_mutex);
+static void get_attack_state(int *mode, int modes[8], unsigned int *delay) {
+    pthread_mutex_lock(&state_mutex);
+    *mode = attack_mode;
+    memcpy(modes, multi_modes, sizeof(multi_modes));
+    *delay = delay_ms;
+    pthread_mutex_unlock(&state_mutex);
+}
 
-    emit("EVENT|ATTACKER|START");
+static void print_help(void) {
+    printf("\nCommands:\n");
+    printf("  attack 0  - No attack\n");
+    printf("  attack 1  - Drop DATA\n");
+    printf("  attack 2  - Delay DATA\n");
+    printf("  attack 3  - Duplicate DATA\n");
+    printf("  attack 4  - Modify DATA\n");
+    printf("  attack 5  - Drop ACK\n");
+    printf("  attack 6  - Random attack\n");
+    printf("  attack 7  - Multiple attacks\n");
+    printf("  delay N   - Delay DATA by N milliseconds\n");
+    printf("  multi A B - Enable attack numbers A and B (0-6)\n");
+    printf("  status    - Show current configuration\n");
+    printf("  help\n");
+    printf("  quit\n\n");
+}
 
-    /* 1. Create listeners */
-    data_listen = make_listener(ATTACKER_DATA_PORT);
-    ack_listen  = make_listener(ATTACKER_ACK_PORT);
-    ctrl_listen = make_listener(CONTROL_PORT);
+static void *control_thread(void *unused) {
+    (void)unused;
+    char line[256];
 
-    if (data_listen == INVALID_SOCKET ||
-        ack_listen  == INVALID_SOCKET ||
-        ctrl_listen == INVALID_SOCKET)
-    {
-        emit("EVENT|ATTACKER|ERROR|msg=Listener creation failed");
-        WSACleanup(); return 1;
+    print_help();
+
+    while (running && fgets(line, sizeof(line), stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+
+        int n;
+        if (sscanf(line, "attack %d", &n) == 1) {
+            if (n < 0 || n > 7) {
+                printf("[ATTACKER] Invalid attack number.\n");
+                continue;
+            }
+
+            pthread_mutex_lock(&state_mutex);
+            attack_mode = n;
+            if (n != 7) memset(multi_modes, 0, sizeof(multi_modes));
+            pthread_mutex_unlock(&state_mutex);
+
+            printf("[ATTACKER] Attack mode = %d\n", n);
+        } else if (sscanf(line, "delay %u", &n) == 1) {
+            pthread_mutex_lock(&state_mutex);
+            delay_ms = (unsigned int)n;
+            pthread_mutex_unlock(&state_mutex);
+            printf("[ATTACKER] Delay = %u ms\n", delay_ms);
+        } else if (strncmp(line, "multi ", 6) == 0) {
+            memset(multi_modes, 0, sizeof(multi_modes));
+            char *p = line + 6;
+            int a, b;
+            if (sscanf(p, "%d %d", &a, &b) >= 1 &&
+                a >= 0 && a <= 6) {
+                multi_modes[a] = 1;
+                if (sscanf(p, "%d %d", &a, &b) == 2 &&
+                    b >= 0 && b <= 6)
+                    multi_modes[b] = 1;
+
+                pthread_mutex_lock(&state_mutex);
+                attack_mode = 7;
+                pthread_mutex_unlock(&state_mutex);
+
+                printf("[ATTACKER] Multiple attacks enabled.\n");
+            } else {
+                printf("[ATTACKER] Usage: multi A B\n");
+            }
+        } else if (strcmp(line, "status") == 0) {
+            int mode, modes[8];
+            unsigned int d;
+            get_attack_state(&mode, modes, &d);
+            printf("[ATTACKER] Mode=%d Delay=%u ms Multiple:",
+                   mode, d);
+            for (int i = 0; i < 8; ++i)
+                if (modes[i]) printf(" %d", i);
+            printf("\n");
+        } else if (strcmp(line, "help") == 0) {
+            print_help();
+        } else if (strcmp(line, "quit") == 0) {
+            running = 0;
+            break;
+        } else if (*line != '\0') {
+            printf("[ATTACKER] Unknown command. Type 'help'.\n");
+        }
     }
-    emit("EVENT|ATTACKER|LISTENERS_READY|data_port=%d|ack_port=%d|ctrl_port=%d",
-         ATTACKER_DATA_PORT, ATTACKER_ACK_PORT, CONTROL_PORT);
 
-    /* 2. Control thread */
-    HANDLE ctrl_thr = (HANDLE)_beginthreadex(NULL, 0, control_thread, NULL, 0, NULL);
-    if (ctrl_thr) CloseHandle(ctrl_thr);
+    running = 0;
+    return NULL;
+}
 
-    /* 3. Connect to receiver (DATA) and sender (ACK) */
-    emit("EVENT|ATTACKER|CONNECTING_RECEIVER|host=%s|port=%d",
-         RECEIVER_DATA_HOST, RECEIVER_DATA_PORT);
-    to_receiver_sock = connect_to(RECEIVER_DATA_HOST, RECEIVER_DATA_PORT);
-    if (to_receiver_sock == INVALID_SOCKET) {
-        emit("EVENT|ATTACKER|ERROR|msg=Cannot connect to receiver");
-        WSACleanup(); return 1;
-    }
-    emit("EVENT|ATTACKER|RECEIVER_CONNECTED");
+static void apply_modify(Packet *p) {
+    if (p->length == 0) return;
+    p->data[0] = (p->data[0] == 'X') ? 'x' : 'X';
+    /* Deliberately retain the original checksum to demonstrate detection. */
+}
 
-    emit("EVENT|ATTACKER|CONNECTING_SENDER_ACK|host=%s|port=%d",
-         SENDER_ACK_HOST, SENDER_ACK_PORT);
-    to_sender_ack_sock = connect_to(SENDER_ACK_HOST, SENDER_ACK_PORT);
-    if (to_sender_ack_sock == INVALID_SOCKET) {
-        emit("EVENT|ATTACKER|ERROR|msg=Cannot connect to sender ACK port");
-        WSACleanup(); return 1;
-    }
-    emit("EVENT|ATTACKER|SENDER_ACK_CONNECTED");
+static int forward_packet(int fd, const Packet *p) {
+    FrameHeader h = {
+        htonl(p->type),
+        htonl(p->sequence),
+        htonl(p->length),
+        htonl(p->checksum)
+    };
 
-    /* 4. Accept connections from sender (DATA) and receiver (ACK) */
-    emit("EVENT|ATTACKER|WAIT_SENDER_DATA");
-    struct sockaddr_in cli;
-    int clen = sizeof(cli);
-    sender_data_sock = accept(data_listen, (struct sockaddr*)&cli, &clen);
-    if (sender_data_sock == INVALID_SOCKET) {
-        emit("EVENT|ATTACKER|ERROR|msg=Accept sender DATA failed");
-        WSACleanup(); return 1;
-    }
-    emit("EVENT|ATTACKER|SENDER_DATA_ACCEPTED");
-
-    emit("EVENT|ATTACKER|WAIT_RECEIVER_ACK");
-    receiver_ack_sock = accept(ack_listen, (struct sockaddr*)&cli, &clen);
-    if (receiver_ack_sock == INVALID_SOCKET) {
-        emit("EVENT|ATTACKER|ERROR|msg=Accept receiver ACK failed");
-        WSACleanup(); return 1;
-    }
-    emit("EVENT|ATTACKER|RECEIVER_ACK_ACCEPTED");
-
-    emit("EVENT|SYSTEM|READY|role=attacker");
-
-    /* 5. Start DATA and ACK forwarding threads */
-    HANDLE dthr = (HANDLE)_beginthreadex(NULL, 0, data_thread, NULL, 0, NULL);
-    HANDLE athr = (HANDLE)_beginthreadex(NULL, 0, ack_thread,  NULL, 0, NULL);
-
-    WaitForSingleObject(dthr, INFINITE);
-    WaitForSingleObject(athr, INFINITE);
-    CloseHandle(dthr);
-    CloseHandle(athr);
-
-    closesocket(sender_data_sock);
-    closesocket(receiver_ack_sock);
-    closesocket(to_receiver_sock);
-    closesocket(to_sender_ack_sock);
-    closesocket(data_listen);
-    closesocket(ack_listen);
-    closesocket(ctrl_listen);
-
-    DeleteCriticalSection(&attack_mutex);
-    DeleteCriticalSection(&stats_mutex);
-
-    emit("EVENT|ATTACKER|SHUTDOWN");
-    WSACleanup();
+    if (send_all(fd, &h, sizeof(h)) < 0) return -1;
+    if (p->length && send_all(fd, p->data, p->length) < 0) return -1;
     return 0;
+}
+
+static int random_attack(void) {
+    return rand() % 6 + 1; /* 1..6 */
+}
+
+static int process_data(Packet *p, int receiver_fd, int mode, int modes[8],
+                        unsigned int delay) {
+    int do_drop = 0, do_delay = 0, do_duplicate = 0, do_modify = 0;
+
+    if (mode == 6) {
+        int r = random_attack();
+        printf("[ATTACKER] Random attack selected: %d\n", r);
+        mode = r;
+    }
+
+    if (mode == 1) do_drop = 1;
+    if (mode == 2) do_delay = 1;
+    if (mode == 3) do_duplicate = 1;
+    if (mode == 4) do_modify = 1;
+
+    if (mode == 7) {
+        do_drop = modes[1];
+        do_delay = modes[2];
+        do_duplicate = modes[3];
+        do_modify = modes[4];
+    }
+
+    printf("\n[ATTACKER] DATA intercepted: seq=%u data=\"%.*s\"\n",
+           p->sequence, (int)p->length, p->data);
+
+    if (do_modify) {
+        apply_modify(p);
+        printf("[ATTACKER] DATA MODIFIED: \"%.*s\"\n",
+               (int)p->length, p->data);
+    }
+
+    if (do_drop) {
+        printf("[ATTACKER] DATA DROPPED.\n");
+        return 0;
+    }
+
+    if (do_delay) {
+        printf("[ATTACKER] DATA DELAYED by %u ms.\n", delay);
+        usleep(delay * 1000u);
+    }
+
+    if (forward_packet(receiver_fd, p) < 0)
+        return -1;
+
+    printf("[ATTACKER] DATA FORWARDED: seq=%u\n", p->sequence);
+
+    if (do_duplicate) {
+        if (forward_packet(receiver_fd, p) < 0)
+            return -1;
+        printf("[ATTACKER] DATA DUPLICATED: seq=%u\n", p->sequence);
+    }
+
+    return 0;
+}
+
+static int process_ack(const Packet *p, int sender_fd, int mode, int modes[8]) {
+    int drop = 0;
+
+    if (mode == 6) {
+        int r = random_attack();
+        printf("[ATTACKER] Random attack selected for ACK: %d\n", r);
+        if (r == 5) drop = 1;
+    } else if (mode == 5) {
+        drop = 1;
+    } else if (mode == 7) {
+        drop = modes[5];
+    }
+
+    printf("[ATTACKER] ACK intercepted: seq=%u\n", p->sequence);
+
+    if (drop) {
+        printf("[ATTACKER] ACK DROPPED: seq=%u\n", p->sequence);
+        return 0;
+    }
+
+    if (forward_packet(sender_fd, p) < 0)
+        return -1;
+
+    printf("[ATTACKER] ACK FORWARDED: seq=%u\n", p->sequence);
+    return 0;
+}
+
+static void *data_thread(void *arg) {
+    RelayArgs *a = arg;
+    while (running) {
+        FrameHeader wire;
+        int rr = recv_all(a->sender_fd, &wire, sizeof(wire));
+        if (rr <= 0) {
+            running = 0;
+            break;
+        }
+
+        Packet p;
+        p.type = ntohl(wire.type);
+        p.sequence = ntohl(wire.sequence);
+        p.length = ntohl(wire.length);
+        p.checksum = ntohl(wire.checksum);
+
+        if (p.length > MAX_DATA) {
+            printf("[ATTACKER] Invalid DATA length. Closing sender connection.\n");
+            running = 0;
+            break;
+        }
+
+        if (p.length && recv_all(a->sender_fd, p.data, p.length) <= 0) {
+            running = 0;
+            break;
+        }
+
+        if (p.type != TYPE_DATA) {
+            printf("[ATTACKER] Non-DATA frame from sender ignored.\n");
+            continue;
+        }
+
+        int mode, modes[8];
+        unsigned int delay;
+        get_attack_state(&mode, modes, &delay);
+
+        if (process_data(&p, a->receiver_fd, mode, modes, delay) < 0) {
+            running = 0;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void *ack_thread(void *arg) {
+    RelayArgs *a = arg;
+    while (running) {
+        FrameHeader wire;
+        int rr = recv_all(a->receiver_fd, &wire, sizeof(wire));
+        if (rr <= 0) {
+            running = 0;
+            break;
+        }
+
+        Packet p;
+        p.type = ntohl(wire.type);
+        p.sequence = ntohl(wire.sequence);
+        p.length = ntohl(wire.length);
+        p.checksum = ntohl(wire.checksum);
+
+        if (p.length > MAX_DATA) {
+            running = 0;
+            break;
+        }
+
+        if (p.length && recv_all(a->receiver_fd, p.data, p.length) <= 0) {
+            running = 0;
+            break;
+        }
+
+        if (p.type != TYPE_ACK) {
+            printf("[ATTACKER] Non-ACK frame from receiver ignored.\n");
+            continue;
+        }
+
+        int mode, modes[8];
+        unsigned int delay;
+        get_attack_state(&mode, modes, &delay);
+        (void)delay;
+
+        if (process_ack(&p, a->sender_fd, mode, modes) < 0) {
+            running = 0;
+            break;
+        }
+    }
+    return NULL;
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    srand((unsigned int)(time(NULL) ^ getpid()));
+
+    printf("=== MAN-IN-THE-MIDDLE ATTACKER ===\n");
+
+    int listenfd = create_listener();
+    if (listenfd < 0) return EXIT_FAILURE;
+
+    printf("[ATTACKER] Listening for sender on %s:%d\n",
+           LISTEN_IP, LISTEN_PORT);
+
+    int receiver_fd = connect_receiver();
+    if (receiver_fd < 0) {
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+
+    printf("[ATTACKER] Waiting for sender connection...\n");
+
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    int sender_fd = accept(listenfd, (struct sockaddr *)&peer, &peer_len);
+    if (sender_fd < 0) {
+        perror("attacker: accept");
+        close(receiver_fd);
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+
+    printf("[ATTACKER] Sender connected. MITM is active.\n");
+
+    RelayArgs args = {sender_fd, receiver_fd};
+    pthread_t data_tid, ack_tid, ctl_tid;
+
+    if (pthread_create(&data_tid, NULL, data_thread, &args) != 0 ||
+        pthread_create(&ack_tid, NULL, ack_thread, &args) != 0 ||
+        pthread_create(&ctl_tid, NULL, control_thread, NULL) != 0) {
+        fprintf(stderr, "[ATTACKER] Failed to create threads.\n");
+        running = 0;
+        close(sender_fd);
+        close(receiver_fd);
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+
+    pthread_join(data_tid, NULL);
+    running = 0;
+    shutdown(sender_fd, SHUT_RDWR);
+    shutdown(receiver_fd, SHUT_RDWR);
+    pthread_join(ack_tid, NULL);
+    pthread_cancel(ctl_tid);
+    pthread_join(ctl_tid, NULL);
+
+    close(sender_fd);
+    close(receiver_fd);
+    close(listenfd);
+
+    printf("[ATTACKER] Stopped.\n");
+    return EXIT_SUCCESS;
 }
