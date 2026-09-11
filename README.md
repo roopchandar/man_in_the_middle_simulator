@@ -24,8 +24,6 @@ network_attack_demo/
 ├── sender.c      — Stop-and-Wait sender, reads SEND| commands from stdin
 ├── attacker.c    — MITM relay with 8 attack modes and a TCP control port
 ├── receiver.c    — Validates checksum/sequence, sends ACKs
-├── gui.py        — Tkinter 3-screen GUI, process controller, event parser
-├── Makefile
 └── README.md
 ```
 
@@ -41,17 +39,9 @@ network_attack_demo/
 
 ---
 
-## 4. Three GUI Screens
 
-| Screen | Title | Purpose |
-|--------|-------|---------|
-| Screen 1 | SENDER MACHINE | Message input, frame visualiser, retransmission view |
-| Screen 2 | ATTACKER / MITM | Attack selector, flow visualiser, statistics |
-| Screen 3 | RECEIVER MACHINE | Frame validation, delivered messages, statistics |
 
----
-
-## 5. Port Layout
+## 4. Port Layout
 
 | Connection | Direction | Port |
 |-----------|-----------|------|
@@ -155,121 +145,3 @@ Implemented entirely in C:
 | Multiple Attacks | Combination of selected attack effects |
 
 ---
-
-## 10. Python ↔ C Communication
-
-### GUI → attacker.c (TCP control on port 5100)
-
-```
-SET_ATTACK|0           # No attack
-SET_ATTACK|1           # Drop Data
-SET_ATTACK|2           # Delay Data
-SET_ATTACK|3           # Duplicate Data
-SET_ATTACK|4           # Modify Data
-SET_ATTACK|5           # Drop ACK
-SET_ATTACK|6           # Random
-SET_ATTACK|7           # Multiple
-SET_DELAY|2000         # Set delay ms
-SET_ATTACKS|DROP_DATA,MODIFY_DATA,DROP_ACK   # Multi bitmask
-```
-
-### GUI → sender.c (stdin pipe)
-
-```
-SEND|Hello World       # Send a message
-QUIT                   # Shutdown sender
-```
-
-### C → GUI (stdout pipe, EVENT| protocol)
-
-```
-EVENT|SYSTEM|READY|role=sender
-EVENT|SENDER|DATA_SENT|seq=0|data=Hello World|checksum=1116
-EVENT|SENDER|WAIT_ACK|seq=0|attempt=1
-EVENT|SENDER|ACK_TIMEOUT|seq=0
-EVENT|SENDER|RETRANSMIT|seq=0|attempt=2
-EVENT|SENDER|ACK_RECEIVED|seq=0
-EVENT|ATTACKER|DATA_RECEIVED|seq=0|attack=NO_ATTACK
-EVENT|ATTACKER|DATA_FORWARDED|seq=0
-EVENT|ATTACKER|DATA_DROPPED|seq=0
-EVENT|ATTACKER|DATA_DELAYED|seq=0|delay=2000
-EVENT|ATTACKER|DATA_DUPLICATED|seq=0
-EVENT|ATTACKER|DATA_MODIFIED|seq=0
-EVENT|ATTACKER|ACK_RECEIVED|seq=0
-EVENT|ATTACKER|ACK_DROPPED|seq=0
-EVENT|ATTACKER|ACK_FORWARDED|seq=0
-EVENT|ATTACKER|STATS|intercepted=5|forwarded=4|dropped=1|...
-EVENT|RECEIVER|DATA_RECEIVED|seq=0|data=Hello World|recv_checksum=1116|calc_checksum=1116
-EVENT|RECEIVER|CHECKSUM_VALID|seq=0
-EVENT|RECEIVER|CHECKSUM_INVALID|seq=0|recv_checksum=1116|calc_checksum=1138
-EVENT|RECEIVER|DUPLICATE|seq=1|expected=0
-EVENT|RECEIVER|DELIVERED|seq=0|data=Hello World
-EVENT|RECEIVER|ACK_SENT|seq=0
-EVENT|RECEIVER|STATS|received=5|valid=4|duplicate=1|corrupted=0|acks=4|expected_seq=0
-```
-
----
-
-## 11. Compilation
-
-```bash
-make          # build sender, attacker, receiver
-make clean    # remove binaries
-```
-
-Manual:
-```bash
-gcc -Wall -g -pthread -o sender   sender.c
-gcc -Wall -g -pthread -o attacker attacker.c
-gcc -Wall -g -pthread -o receiver receiver.c
-```
-
----
-
-## 12. Running
-
-### With GUI (recommended)
-```bash
-python3 gui.py
-```
-Then click **START SYSTEM**.
-
-### Without GUI (terminal mode)
-```bash
-# Terminal 1
-./receiver
-
-# Terminal 2
-./attacker
-
-# Terminal 3
-./sender
-# Type: SEND|Hello World<Enter>
-```
-
----
-
-## 13. Step-by-Step Test Procedure
-
-1. Run `python3 gui.py`
-2. Click **▶ START SYSTEM** — three C processes start
-3. Go to **SENDER** tab → enter `Hello World` → click **SEND MESSAGE**
-4. Observe EVENT LOG: DATA_SENT → WAIT_ACK → ACK_RECEIVED
-5. Go to **ATTACKER** tab → select **Drop Data** → click **APPLY ATTACK**
-6. Back to SENDER → send another message
-7. Observe: ACK TIMEOUT → RETRANSMITTING (attacker dropped the frame)
-8. On ATTACKER tab: flow shows `DATA DROPPED (X)`
-9. Select **No Attack** → APPLY → sender retransmit eventually succeeds
-10. Go to **RECEIVER** tab → see delivered messages list growing
-11. Test **Modify Data** → RECEIVER shows CHECKSUM MISMATCH
-12. Test **Duplicate Data** → RECEIVER shows DUPLICATE FRAME warning
-13. Test **Multiple Attacks** → check Drop ACK + Modify Data combos
-14. Click **■ STOP SYSTEM** to terminate all C processes
-
----
-
-## 14. System Requirements
-
-- Linux (Ubuntu/Debian/Fedora/Arch or WSL on Windows)
-- GCC with pthread support
-- Python 3.7+ with Tkinter (`sudo apt install python3-tk` if missing)
