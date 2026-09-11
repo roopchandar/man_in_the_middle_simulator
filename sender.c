@@ -1,325 +1,250 @@
 /*
- * sender.c  (Windows / Winsock2 port)
- * Man-in-the-Middle Simulator - Sender
+ * sender.c
+ * CLI Stop-and-Wait ARQ sender.
  *
- * Connects to attacker.c, sends DATA frames, waits for ACKs.
- * Implements Stop-and-Wait ARQ with retransmission on timeout.
- * Reads SEND|message commands from stdin (or from GUI via pipe).
- * Emits EVENT| lines to stdout for GUI consumption.
+ * Network:
+ *   sender -> attacker : 127.0.0.1:5000
+ *   ACKs  <- attacker  : same TCP connection
  *
- * Network topology:
- *   sender.c --> attacker.c --> receiver.c
- *   sender.c <-- attacker.c <-- receiver.c
+ * Usage:
+ *   ./sender
+ * Then type messages at the prompt.
  *
- * Ports:
- *   Sender connects to ATTACKER_DATA_PORT (5001)  -- DATA out
- *   Sender listens  on SENDER_ACK_PORT   (5000)  -- ACK  in
+ * Commands:
+ *   /quit
+ *   /reconnect
+ *
+ * The sender constructs DATA frames and performs the ARQ/retransmission.
  */
 
-/* ── Windows / Winsock2 preamble ── */
-#ifndef _WIN32_WINNT
-#  define _WIN32_WINNT 0x0601
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <process.h>   /* _beginthreadex */
-#include <windows.h>
-#include <time.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-/* ─── Port configuration ──────────────────────────────────────────────────── */
-#define ATTACKER_DATA_HOST "127.0.0.1"
-#define ATTACKER_DATA_PORT  5001
-#define SENDER_ACK_PORT     5000
+#define ATTACKER_IP "127.0.0.1"
+#define ATTACKER_PORT 5000
+#define MAX_DATA 1023
+#define ACK_TIMEOUT_SEC 2
+#define MAX_ATTEMPTS 10
 
-/* ─── Protocol constants ──────────────────────────────────────────────────── */
-#define MAX_DATA_LEN    1024
-#define ACK_TIMEOUT_SEC 3
-#define MAX_RETRANSMIT  10
+#define TYPE_DATA 1u
+#define TYPE_ACK  2u
 
-#define FRAME_DATA 0
-#define FRAME_ACK  1
-
-/* ─── Frame ───────────────────────────────────────────────────────────────── */
 typedef struct {
-    int          type;
-    int          sequence;
-    char         data[MAX_DATA_LEN];
-    unsigned int checksum;
-} Frame;
+    uint32_t type;
+    uint32_t sequence;
+    uint32_t length;
+    uint32_t checksum;
+} FrameHeader;
 
-/* ─── Globals ─────────────────────────────────────────────────────────────── */
-static SOCKET data_sock   = INVALID_SOCKET;
-static SOCKET ack_listen  = INVALID_SOCKET;
-static volatile SOCKET ack_sock = INVALID_SOCKET;
-
-static CRITICAL_SECTION send_mutex;
-
-/* ─── Checksum ────────────────────────────────────────────────────────────── */
-static unsigned int compute_checksum(const char *data, int len)
-{
-    unsigned int sum = 0;
-    for (int i = 0; i < len; i++)
-        sum += (unsigned char)data[i];
+static uint32_t checksum_bytes(const unsigned char *data, size_t len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; ++i)
+        sum = (sum + data[i]) & 0xFFFFFFFFu;
     return sum;
 }
 
-/* ─── Emit ────────────────────────────────────────────────────────────────── */
-static void emit(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    putchar('\n');
-    fflush(stdout);
-}
-
-/* ─── Helpers ─────────────────────────────────────────────────────────────── */
-static int send_all(SOCKET fd, const void *buf, size_t len)
-{
-    size_t sent = 0;
-    while (sent < len) {
-        int n = send(fd, (const char*)buf + sent, (int)(len - sent), 0);
-        if (n <= 0) return -1;
-        sent += n;
+static int send_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += n;
+        len -= (size_t)n;
     }
     return 0;
 }
 
-static int recv_all(SOCKET fd, void *buf, size_t len)
-{
-    size_t got = 0;
-    while (got < len) {
-        int n = recv(fd, (char*)buf + got, (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += n;
+static int recv_all(int fd, void *buf, size_t len) {
+    unsigned char *p = buf;
+    while (len) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return 0;
+        p += n;
+        len -= (size_t)n;
     }
-    return 0;
+    return 1;
 }
 
-/* ─── Setup ACK listener ──────────────────────────────────────────────────── */
-static SOCKET setup_ack_listener(void)
-{
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
-
-    int opt = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(SENDER_ACK_PORT);
-
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(s); return INVALID_SOCKET;
+static int connect_attacker(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("sender: socket");
+        return -1;
     }
-    if (listen(s, 1) == SOCKET_ERROR) {
-        closesocket(s); return INVALID_SOCKET;
-    }
-    return s;
-}
-
-/* ─── Connect to attacker (DATA) ──────────────────────────────────────────── */
-static SOCKET connect_to_attacker(void)
-{
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(ATTACKER_DATA_PORT);
-    inet_pton(AF_INET, ATTACKER_DATA_HOST, &addr.sin_addr);
+    addr.sin_port = htons(ATTACKER_PORT);
+    inet_pton(AF_INET, ATTACKER_IP, &addr.sin_addr);
 
-    for (int i = 0; i < 20; i++) {
-        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0)
-            return s;
-        Sleep(500);
+    for (int attempt = 1; attempt <= 10; ++attempt) {
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            printf("[SENDER] Connected to attacker at %s:%d\n",
+                   ATTACKER_IP, ATTACKER_PORT);
+            fflush(stdout);
+            return fd;
+        }
+
+        if (attempt == 10) break;
+        printf("[SENDER] Attacker not ready; retrying (%d/10)...\n", attempt);
+        fflush(stdout);
+        sleep(1);
     }
-    closesocket(s);
-    return INVALID_SOCKET;
+
+    perror("sender: connect");
+    close(fd);
+    return -1;
 }
 
-/* ─── ACK accept thread ───────────────────────────────────────────────────── */
-static unsigned __stdcall ack_accept_thread(void *arg)
-{
-    (void)arg;
-    struct sockaddr_in cli;
-    int clen = sizeof(cli);
-    emit("EVENT|SENDER|ACK_LISTEN_START|port=%d", SENDER_ACK_PORT);
-    SOCKET s = accept(ack_listen, (struct sockaddr*)&cli, &clen);
-    if (s != INVALID_SOCKET) {
-        ack_sock = s;
-        emit("EVENT|SENDER|ACK_CONNECTED");
-    } else {
-        emit("EVENT|SENDER|ERROR|msg=ACK accept failed");
-    }
-    return 0;
-}
-
-/* ─── Wait for ACK with timeout ──────────────────────────────────────────── */
-static int wait_for_ack(int expected_seq, int timeout_sec)
-{
-    if (ack_sock == INVALID_SOCKET) {
-        emit("EVENT|SENDER|ERROR|msg=No ACK socket");
-        return -1;
-    }
-
+static int wait_for_ack(int fd, uint32_t expected_seq) {
+    fd_set readfds;
     struct timeval tv;
-    tv.tv_sec  = timeout_sec;
+
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+    tv.tv_sec = ACK_TIMEOUT_SEC;
     tv.tv_usec = 0;
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(ack_sock, &rfds);
-
-    int r = select(0, &rfds, NULL, NULL, &tv);  /* first arg ignored on Windows */
-    if (r == 0)  return 0;
-    if (r < 0)   return -1;
-
-    Frame ack;
-    memset(&ack, 0, sizeof(ack));
-    if (recv_all(ack_sock, &ack, sizeof(Frame)) < 0)
+    int rc = select(fd + 1, &readfds, NULL, NULL, &tv);
+    if (rc == 0) return 0;       /* timeout */
+    if (rc < 0) {
+        if (errno == EINTR) return 0;
         return -1;
+    }
 
-    if (ack.type == FRAME_ACK && ack.sequence == expected_seq) {
-        emit("EVENT|SENDER|ACK_RECEIVED|seq=%d", expected_seq);
+    FrameHeader h;
+    int rr = recv_all(fd, &h, sizeof(h));
+    if (rr <= 0) return -1;
+
+    uint32_t type = ntohl(h.type);
+    uint32_t seq  = ntohl(h.sequence);
+    uint32_t len  = ntohl(h.length);
+
+    if (len > 0) {
+        unsigned char discard[MAX_DATA];
+        if (len > MAX_DATA) return -1;
+        if (recv_all(fd, discard, len) <= 0) return -1;
+    }
+
+    if (type == TYPE_ACK && seq == expected_seq) {
         return 1;
     }
-    emit("EVENT|SENDER|WRONG_ACK|expected=%d|got=%d", expected_seq, ack.sequence);
+
+    printf("[SENDER] Ignoring unexpected ACK/frame (type=%u seq=%u)\n",
+           type, seq);
+    fflush(stdout);
     return 0;
 }
 
-/* ─── Send one message (Stop-and-Wait ARQ) ───────────────────────────────── */
-static void send_message(const char *message, int *seq)
-{
-    Frame frame;
-    memset(&frame, 0, sizeof(frame));
-    frame.type     = FRAME_DATA;
-    frame.sequence = *seq;
-    strncpy(frame.data, message, MAX_DATA_LEN - 1);
-    frame.data[MAX_DATA_LEN - 1] = '\0';
-    frame.checksum = compute_checksum(frame.data, (int)strlen(frame.data));
+static int send_message(int *sockfd, uint32_t seq, const char *message) {
+    size_t len = strlen(message);
+    if (len == 0) {
+        printf("[SENDER] Empty message ignored.\n");
+        return 1;
+    }
+    if (len > MAX_DATA) {
+        printf("[SENDER] Message too long. Maximum is %d bytes.\n", MAX_DATA);
+        return 1;
+    }
 
-    int attempt = 0, ack_ok = 0;
+    uint32_t checksum = checksum_bytes((const unsigned char *)message, len);
 
-    while (!ack_ok && attempt < MAX_RETRANSMIT) {
-        attempt++;
+    FrameHeader h;
+    h.type = htonl(TYPE_DATA);
+    h.sequence = htonl(seq);
+    h.length = htonl((uint32_t)len);
+    h.checksum = htonl(checksum);
 
-        EnterCriticalSection(&send_mutex);
-        int r = send_all(data_sock, &frame, sizeof(Frame));
-        LeaveCriticalSection(&send_mutex);
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        if (*sockfd < 0) {
+            *sockfd = connect_attacker();
+            if (*sockfd < 0) return 0;
+        }
 
-        if (r < 0) { emit("EVENT|SENDER|ERROR|msg=Send failed"); break; }
+        printf("\n[SENDER] DATA seq=%u attempt=%d\n", seq, attempt);
+        printf("[SENDER]   Data     : %s\n", message);
+        printf("[SENDER]   Checksum : %u\n", checksum);
+        fflush(stdout);
 
-        emit("EVENT|SENDER|DATA_SENT|seq=%d|data=%s|checksum=%u",
-             frame.sequence, frame.data, frame.checksum);
-        emit("EVENT|SENDER|WAIT_ACK|seq=%d|attempt=%d", frame.sequence, attempt);
+        if (send_all(*sockfd, &h, sizeof(h)) < 0 ||
+            send_all(*sockfd, message, len) < 0) {
+            printf("[SENDER] Send failed. Reconnecting...\n");
+            close(*sockfd);
+            *sockfd = -1;
+            continue;
+        }
 
-        int res = wait_for_ack(frame.sequence, ACK_TIMEOUT_SEC);
+        int ack = wait_for_ack(*sockfd, seq);
+        if (ack == 1) {
+            printf("[SENDER] ACK %u received. Delivery complete.\n", seq);
+            fflush(stdout);
+            return 1;
+        }
 
-        if (res == 1) {
-            ack_ok = 1;
-            emit("EVENT|SENDER|ACK_OK|seq=%d", frame.sequence);
-            *seq = 1 - *seq;
-        } else if (res == 0) {
-            emit("EVENT|SENDER|ACK_TIMEOUT|seq=%d", frame.sequence);
-            if (attempt < MAX_RETRANSMIT)
-                emit("EVENT|SENDER|RETRANSMIT|seq=%d|attempt=%d",
-                     frame.sequence, attempt + 1);
+        if (ack == 0) {
+            printf("[SENDER] ACK timeout/unexpected ACK. Retransmitting...\n");
         } else {
-            emit("EVENT|SENDER|ERROR|msg=ACK receive error");
-            break;
+            printf("[SENDER] Connection lost while waiting for ACK. Reconnecting...\n");
+            close(*sockfd);
+            *sockfd = -1;
         }
+        fflush(stdout);
     }
-    if (!ack_ok)
-        emit("EVENT|SENDER|MAX_RETRANSMIT|seq=%d", frame.sequence);
+
+    printf("[SENDER] Maximum attempts reached. Message failed.\n");
+    fflush(stdout);
+    return 0;
 }
 
-/* ─── Stdin loop ──────────────────────────────────────────────────────────── */
-static void stdin_loop(void)
-{
-    char line[MAX_DATA_LEN + 32];
-    int  seq = 0;
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
 
-    emit("EVENT|SENDER|READY");
+    printf("=== STOP-AND-WAIT ARQ SENDER ===\n");
+    printf("Attacker: %s:%d\n", ATTACKER_IP, ATTACKER_PORT);
+    printf("Type a message and press Enter. /quit exits.\n\n");
 
-    while (fgets(line, sizeof(line), stdin)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
-        if (len > 0 && line[len-1] == '\r') line[--len] = '\0';
+    int sockfd = connect_attacker();
+    uint32_t sequence = 0;
+    char input[MAX_DATA + 2];
 
-        if (strncmp(line, "SEND|", 5) == 0) {
-            const char *msg = line + 5;
-            emit("EVENT|SENDER|MSG_RECEIVED|data=%s", msg);
-            send_message(msg, &seq);
-        } else if (strcmp(line, "QUIT") == 0 || strcmp(line, "EXIT") == 0) {
+    while (1) {
+        printf("sender> ");
+        if (!fgets(input, sizeof(input), stdin))
             break;
+
+        input[strcspn(input, "\r\n")] = '\0';
+
+        if (strcmp(input, "/quit") == 0)
+            break;
+
+        if (strcmp(input, "/reconnect") == 0) {
+            if (sockfd >= 0) close(sockfd);
+            sockfd = connect_attacker();
+            continue;
         }
-    }
-    emit("EVENT|SENDER|SHUTDOWN");
-}
 
-/* ─── Main ───────────────────────────────────────────────────────────────── */
-int main(void)
-{
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
+        if (send_message(&sockfd, sequence, input))
+            sequence = (sequence + 1) % 2;
     }
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
-
-    InitializeCriticalSection(&send_mutex);
-
-    emit("EVENT|SENDER|START");
-
-    ack_listen = setup_ack_listener();
-    if (ack_listen == INVALID_SOCKET) {
-        emit("EVENT|SENDER|ERROR|msg=Cannot create ACK listener");
-        WSACleanup();
-        return 1;
-    }
-
-    HANDLE thr = (HANDLE)_beginthreadex(NULL, 0, ack_accept_thread, NULL, 0, NULL);
-    if (thr) CloseHandle(thr);
-
-    emit("EVENT|SENDER|CONNECTING|host=%s|port=%d",
-         ATTACKER_DATA_HOST, ATTACKER_DATA_PORT);
-    data_sock = connect_to_attacker();
-    if (data_sock == INVALID_SOCKET) {
-        emit("EVENT|SENDER|ERROR|msg=Cannot connect to attacker");
-        closesocket(ack_listen);
-        WSACleanup();
-        return 1;
-    }
-    emit("EVENT|SENDER|DATA_CONNECTED|port=%d", ATTACKER_DATA_PORT);
-
-    /* Wait up to 10 s for the ACK connection */
-    for (int i = 0; i < 20 && ack_sock == INVALID_SOCKET; i++)
-        Sleep(500);
-
-    if (ack_sock == INVALID_SOCKET)
-        emit("EVENT|SENDER|ERROR|msg=ACK connection not established");
-
-    emit("EVENT|SYSTEM|READY|role=sender");
-
-    stdin_loop();
-
-    if (data_sock  != INVALID_SOCKET) closesocket(data_sock);
-    if (ack_sock   != INVALID_SOCKET) closesocket(ack_sock);
-    if (ack_listen != INVALID_SOCKET) closesocket(ack_listen);
-
-    DeleteCriticalSection(&send_mutex);
-    WSACleanup();
+    if (sockfd >= 0) close(sockfd);
+    printf("\n[SENDER] Stopped.\n");
     return 0;
 }
